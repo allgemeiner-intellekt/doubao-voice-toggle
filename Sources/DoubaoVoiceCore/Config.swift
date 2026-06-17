@@ -24,6 +24,18 @@ public enum DoubaoVoiceConfig {
     applicationSupportDirectory.appendingPathComponent("bin", isDirectory: true)
   }
 
+  public static var logDirectory: URL {
+    applicationSupportDirectory.appendingPathComponent("logs", isDirectory: true)
+  }
+
+  public static var toggleLogURL: URL {
+    logDirectory.appendingPathComponent("toggle.log", isDirectory: false)
+  }
+
+  public static var toggleErrorLogURL: URL {
+    logDirectory.appendingPathComponent("toggle.err.log", isDirectory: false)
+  }
+
   public static var installedToggleURL: URL {
     binDirectory.appendingPathComponent("doubao-voice-toggle", isDirectory: false)
   }

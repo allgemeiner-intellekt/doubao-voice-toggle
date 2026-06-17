@@ -62,6 +62,12 @@ Then restart the LaunchAgent:
 ./scripts/restart.sh
 ```
 
+To request the permission prompts explicitly:
+
+```sh
+./scripts/request-permissions.sh
+```
+
 Doubao itself owns microphone permission.
 
 ## Commands

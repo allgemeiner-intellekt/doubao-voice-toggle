@@ -29,10 +29,28 @@ enum ToggleError: Error, CustomStringConvertible {
   }
 }
 
+func logToggle(_ message: String) {
+  let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+  try? FileManager.default.createDirectory(
+    at: DoubaoVoiceConfig.logDirectory,
+    withIntermediateDirectories: true
+  )
+  FileManager.default.createFile(atPath: DoubaoVoiceConfig.toggleLogURL.path, contents: nil)
+
+  if let handle = try? FileHandle(forWritingTo: DoubaoVoiceConfig.toggleLogURL) {
+    defer { try? handle.close() }
+    _ = try? handle.seekToEnd()
+    if let data = line.data(using: .utf8) {
+      _ = try? handle.write(contentsOf: data)
+    }
+  }
+}
+
 enum Command {
   case toggle
   case status
   case reset(overrideMuted: Bool?)
+  case requestPermissions
   case help
 }
 
@@ -68,6 +86,30 @@ func selectInputSource(_ id: String) throws {
   }
 }
 
+func selectInputSourceWithRetry(_ id: String, timeout: TimeInterval = 2.0) throws {
+  let deadline = Date().addingTimeInterval(timeout)
+  var lastError: Error?
+
+  repeat {
+    do {
+      try selectInputSource(id)
+      usleep(100_000)
+
+      if currentInputSourceID() == id {
+        return
+      }
+
+      lastError = ToggleError.sourceSelectionFailed(id)
+    } catch {
+      lastError = error
+    }
+
+    usleep(150_000)
+  } while Date() < deadline
+
+  throw lastError ?? ToggleError.sourceSelectionFailed(id)
+}
+
 @discardableResult
 func runOsa(_ script: String) throws -> String {
   let process = Process()
@@ -100,7 +142,19 @@ func setOutputMuted(_ muted: Bool) throws {
   _ = try runOsa("set volume output muted \(muted ? "true" : "false")")
 }
 
+@discardableResult
+func requestPostEventPermission() -> Bool {
+  if CGPreflightPostEventAccess() {
+    return true
+  }
+  return CGRequestPostEventAccess()
+}
+
 func postRightOptionTap() throws {
+  guard requestPostEventPermission() else {
+    throw ToggleError.keyPostFailed
+  }
+
   guard let source = CGEventSource(stateID: .hidSystemState),
         let down = CGEvent(keyboardEventSource: source, virtualKey: DoubaoVoiceConfig.rightOptionKeyCode, keyDown: true),
         let up = CGEvent(keyboardEventSource: source, virtualKey: DoubaoVoiceConfig.rightOptionKeyCode, keyDown: false) else {
@@ -120,6 +174,10 @@ func postRightOptionTap() throws {
 func ensureApplicationSupportDirectory() throws {
   try FileManager.default.createDirectory(
     at: DoubaoVoiceConfig.applicationSupportDirectory,
+    withIntermediateDirectories: true
+  )
+  try FileManager.default.createDirectory(
+    at: DoubaoVoiceConfig.logDirectory,
     withIntermediateDirectories: true
   )
 }
@@ -149,6 +207,7 @@ func startVoiceInput() throws {
   }
 
   let wasMuted = try readOutputMuted()
+  logToggle("start: previousInputSourceID=\(previousInputSourceID), previousOutputMuted=\(wasMuted)")
   let state = VoiceState(
     previousInputSourceID: previousInputSourceID,
     previousOutputMuted: wasMuted,
@@ -159,12 +218,14 @@ func startVoiceInput() throws {
 
   do {
     try setOutputMuted(true)
-    try selectInputSource(DoubaoVoiceConfig.doubaoInputSourceID)
+    try selectInputSourceWithRetry(DoubaoVoiceConfig.doubaoInputSourceID, timeout: 1.0)
+    logToggle("start: selected Doubao, currentInputSourceID=\(currentInputSourceID() ?? "unknown")")
     usleep(180_000)
     try postRightOptionTap()
+    logToggle("start: posted right Option")
     print("Doubao voice input started")
   } catch {
-    try? selectInputSource(previousInputSourceID)
+    try? selectInputSourceWithRetry(previousInputSourceID, timeout: 1.0)
     try? setOutputMuted(wasMuted)
     clearState()
     throw error
@@ -172,23 +233,56 @@ func startVoiceInput() throws {
 }
 
 func stopVoiceInput(_ state: VoiceState) throws {
+  logToggle("stop: restoring previousInputSourceID=\(state.previousInputSourceID), currentBeforeStop=\(currentInputSourceID() ?? "unknown")")
   try postRightOptionTap()
-  usleep(650_000)
+  logToggle("stop: posted right Option")
 
   var restoreMessages: [String] = []
-  do {
-    try selectInputSource(state.previousInputSourceID)
-  } catch {
-    restoreMessages.append("input source restore failed: \(error)")
+  usleep(900_000)
+
+  let deadline = Date().addingTimeInterval(3.0)
+  var attempt = 0
+  var stableChecks = 0
+
+  while Date() < deadline {
+    let currentID = currentInputSourceID()
+
+    if currentID == state.previousInputSourceID {
+      stableChecks += 1
+      logToggle("stop: restore stable check \(stableChecks), current=\(currentID ?? "unknown")")
+
+      if stableChecks >= 3 {
+        break
+      }
+
+      usleep(250_000)
+      continue
+    }
+
+    stableChecks = 0
+    attempt += 1
+
+    do {
+      try selectInputSourceWithRetry(state.previousInputSourceID, timeout: 0.6)
+      logToggle("stop: restore attempt \(attempt) selected \(state.previousInputSourceID), current=\(currentInputSourceID() ?? "unknown")")
+    } catch {
+      let message = "input source restore attempt \(attempt) failed: \(error)"
+      logToggle("stop: \(message)")
+      restoreMessages.append(message)
+    }
+
+    usleep(250_000)
   }
 
   do {
     try setOutputMuted(state.previousOutputMuted)
+    logToggle("stop: restored output muted=\(state.previousOutputMuted)")
   } catch {
     restoreMessages.append("mute restore failed: \(error)")
   }
 
   clearState()
+  logToggle("stop: cleared state, finalCurrentInputSourceID=\(currentInputSourceID() ?? "unknown")")
   print("Doubao voice input stopped")
 
   for message in restoreMessages {
@@ -200,7 +294,7 @@ func resetState(overrideMuted: Bool?) throws {
   let state = readState()
 
   if let inputSourceID = state?.previousInputSourceID, !inputSourceID.isEmpty {
-    try? selectInputSource(inputSourceID)
+    try? selectInputSourceWithRetry(inputSourceID)
   }
 
   if let overrideMuted {
@@ -220,6 +314,7 @@ func printStatus() {
   print("State: \(state == nil ? "inactive" : "active")")
   print("State path: \(DoubaoVoiceConfig.stateURL.path)")
   print("Current input source: \(currentInputSourceID() ?? "unknown")")
+  print("Can post synthetic key events: \(CGPreflightPostEventAccess())")
   if let muted = try? readOutputMuted() {
     print("Output muted: \(muted)")
   } else {
@@ -235,7 +330,7 @@ func printStatus() {
 
 func printHelp() {
   print("""
-  Usage: doubao-voice-toggle [--status | --reset [--muted true|false] | --help]
+  Usage: doubao-voice-toggle [--status | --reset [--muted true|false] | --request-permissions | --help]
 
   With no arguments, toggles Doubao voice input:
     first run   saves input/mute state, mutes output, selects Doubao, taps right Option
@@ -259,6 +354,11 @@ func parseCommand(_ arguments: [String]) throws -> Command {
     return .status
   case "--help", "-h", "help":
     return .help
+  case "--request-permissions", "request-permissions":
+    guard args.isEmpty else {
+      throw ToggleError.invalidArguments("--request-permissions does not accept additional arguments")
+    }
+    return .requestPermissions
   case "--reset", "reset":
     var overrideMuted: Bool?
     while !args.isEmpty {
@@ -299,6 +399,9 @@ do {
     printStatus()
   case .reset(let overrideMuted):
     try resetState(overrideMuted: overrideMuted)
+  case .requestPermissions:
+    let allowed = requestPostEventPermission()
+    print("Synthetic key event permission: \(allowed ? "granted" : "not granted")")
   case .help:
     printHelp()
   }

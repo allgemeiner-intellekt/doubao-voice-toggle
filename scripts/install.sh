@@ -53,4 +53,7 @@ LaunchAgent:
 If F8 does not work yet, grant Input Monitoring and Accessibility permission to:
   $BIN_DIR/doubao-voice-hotkey
   $BIN_DIR/doubao-voice-toggle
+
+You can request both permission prompts with:
+  $ROOT_DIR/scripts/request-permissions.sh
 EOF
